@@ -1,0 +1,327 @@
+# ============================================================
+# 墨语 Docker 镜像构建（公开构建仓库版）
+# ============================================================
+# 为什么存在：私有源码仓（aiastia/book）的 Actions 免费额度已耗尽
+# （20261114 起 run 秒挂），公开仓库标准 runner（含 ARM）免费不限量。
+#
+# 架构：
+#   私有仓 aiastia/book（源码，只读 deploy key 拉取）
+#     ↓ 本 workflow 手动触发（workflow_dispatch）
+#   Docker Hub aiastia/book（镜像，必须保持 Private）
+#
+# 本仓库只放本 workflow，不含源码。安全规则：
+#   - 只接受手动触发，无 push / pull_request 触发面
+#   - secrets：SOURCE_DEPLOY_KEY（私有仓只读 deploy key 私钥）、
+#     DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（镜像推送凭证）
+#   - 不做 GHA 层缓存：cache-to type=gha mode=max 会把含源码的层写进
+#     公开仓缓存，任何人可通过 cache API 拉取（20261115 审查结论）
+#
+# 与原私有仓 ci.yml 的差异：
+#   - 删掉按目录变动过滤（公开仓分钟免费，过滤失去意义；跨仓 dispatch
+#     也没有天然的 base SHA）
+#   - GIT_COMMIT 从源码 checkout 实际解析（github.sha 在这里是本仓库的
+#     提交号，不是源码的）
+#   - 新增 images 选择器（all/backend/frontend）和 dry_run（只构建不推送）
+#   - 删掉 cleanup-cache job（没有 GHA 缓存可清）
+#
+# 本地触发：私有仓 scripts/trigger-build.sh（传当前 HEAD 的 commit SHA）
+# ============================================================
+name: Build & Push Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: '私有源码仓 checkout ref（推荐传完整 commit SHA）'
+        required: true
+        default: 'dev'
+      source_branch:
+        description: '源码分支名（决定 tag：dev→backend-dev；main/master→backend+latest）'
+        required: true
+        default: 'dev'
+      images:
+        description: '构建范围: all / backend / frontend'
+        required: true
+        default: 'all'
+      dry_run:
+        description: 'true=只构建不推送不合并（验证链路用）'
+        required: false
+        default: 'false'
+
+# 同一时刻只允许一个构建在跑，避免同 tag 互相覆盖（排队不取消）
+concurrency:
+  group: docker-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: aiastia/book
+
+jobs:
+  # ============================ tag 计算 ============================
+  setup:
+    name: 计算镜像 tag 与构建范围
+    runs-on: ubuntu-24.04
+    outputs:
+      backend_tag: ${{ steps.tags.outputs.backend_tag }}
+      frontend_tag: ${{ steps.tags.outputs.frontend_tag }}
+      build_backend: ${{ steps.tags.outputs.build_backend }}
+      build_frontend: ${{ steps.tags.outputs.build_frontend }}
+    steps:
+      - id: tags
+        env:
+          BRANCH: ${{ inputs.source_branch }}
+          IMAGES: ${{ inputs.images }}
+        run: |
+          # dev → -dev 后缀不覆盖生产镜像；main/master → 正式 tag（与原 ci.yml 同语义）
+          case "$BRANCH" in
+            main|master) BT=backend;  FT=frontend ;;
+            *)           BT=backend-dev; FT=frontend-dev ;;
+          esac
+          case "$IMAGES" in
+            backend)  echo "build_backend=true";  echo "build_frontend=false" ;;
+            frontend) echo "build_backend=false"; echo "build_frontend=true" ;;
+            *)        echo "build_backend=true";  echo "build_frontend=true" ;;
+          esac
+          {
+            echo "backend_tag=$BT"
+            echo "frontend_tag=$FT"
+          } >> "$GITHUB_OUTPUT"
+
+  # ============================ 后端 ============================
+  # 多架构策略与原 ci.yml 一致：x86 / ARM 原生 runner 并行编译（不用 QEMU），
+  # 再用 imagetools create 合并成同一个多架构 tag。
+  build-backend-amd64:
+    name: 后端 amd64
+    needs: setup
+    if: needs.setup.outputs.build_backend == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 拉取私有源码
+        uses: actions/checkout@v6
+        with:
+          repository: aiastia/book
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+
+      - name: 记录源码版本（github.sha 是本仓库的提交号，源码版本必须从 checkout 解析）
+        run: echo "SOURCE_SHA=$(git -C source rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: inputs.dry_run != 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push (amd64)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ./source/backend
+          platforms: linux/amd64
+          push: ${{ inputs.dry_run != 'true' }}
+          tags: ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}-amd64
+          # 禁用 provenance/attestation，否则合并出的 manifest list 带 attestation 项
+          provenance: false
+          # 版本信息注入 /api/health（BUILD_TIME 用 run_started_at：dispatch 无 head_commit）
+          build-args: |
+            GIT_COMMIT=${{ env.SOURCE_SHA }}
+            GIT_BRANCH=${{ inputs.source_branch }}
+            BUILD_TIME=${{ github.run_started_at }}
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+  build-backend-arm64:
+    name: 后端 arm64
+    needs: setup
+    if: needs.setup.outputs.build_backend == 'true'
+    runs-on: ubuntu-24.04-arm  # 原生 ARM runner，不用 QEMU
+    steps:
+      - name: 拉取私有源码
+        uses: actions/checkout@v6
+        with:
+          repository: aiastia/book
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+
+      - name: 记录源码版本
+        run: echo "SOURCE_SHA=$(git -C source rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: inputs.dry_run != 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push (arm64)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ./source/backend
+          platforms: linux/arm64
+          push: ${{ inputs.dry_run != 'true' }}
+          tags: ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}-arm64
+          provenance: false
+          build-args: |
+            GIT_COMMIT=${{ env.SOURCE_SHA }}
+            GIT_BRANCH=${{ inputs.source_branch }}
+            BUILD_TIME=${{ github.run_started_at }}
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+  merge-backend:
+    name: 合并后端多架构 tag
+    needs: [setup, build-backend-amd64, build-backend-arm64]
+    if: inputs.dry_run != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Merge into multi-arch tag
+        run: |
+          docker buildx imagetools create -t ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }} \
+            ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}-amd64 \
+            ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}-arm64
+          # main/master 才推 -latest，dev 分支不覆盖 latest（与原 ci.yml 同语义）
+          if [ "${{ needs.setup.outputs.backend_tag }}" = "backend" ]; then
+            docker buildx imagetools create -t ${{ env.IMAGE }}:backend-latest \
+              ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}-amd64 \
+              ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}-arm64
+          fi
+
+      - name: Verify multi-arch manifest
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}
+
+  # ============================ 前端 ============================
+  build-frontend-amd64:
+    name: 前端 amd64
+    needs: setup
+    if: needs.setup.outputs.build_frontend == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 拉取私有源码
+        uses: actions/checkout@v6
+        with:
+          repository: aiastia/book
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: inputs.dry_run != 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push (amd64)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ./source/frontend
+          platforms: linux/amd64
+          push: ${{ inputs.dry_run != 'true' }}
+          tags: ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}-amd64
+          provenance: false
+          build-args: |
+            NUXT_PUBLIC_API_BASE=http://localhost:8000
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+  build-frontend-arm64:
+    name: 前端 arm64
+    needs: setup
+    if: needs.setup.outputs.build_frontend == 'true'
+    runs-on: ubuntu-24.04-arm  # 原生 ARM runner，不用 QEMU
+    steps:
+      - name: 拉取私有源码
+        uses: actions/checkout@v6
+        with:
+          repository: aiastia/book
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: inputs.dry_run != 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push (arm64)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ./source/frontend
+          platforms: linux/arm64
+          push: ${{ inputs.dry_run != 'true' }}
+          tags: ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}-arm64
+          provenance: false
+          build-args: |
+            NUXT_PUBLIC_API_BASE=http://localhost:8000
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+  merge-frontend:
+    name: 合并前端多架构 tag
+    needs: [setup, build-frontend-amd64, build-frontend-arm64]
+    if: inputs.dry_run != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Merge into multi-arch tag
+        run: |
+          docker buildx imagetools create -t ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }} \
+            ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}-amd64 \
+            ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}-arm64
+          # main/master 才推 -latest，dev 分支不覆盖 latest
+          if [ "${{ needs.setup.outputs.frontend_tag }}" = "frontend" ]; then
+            docker buildx imagetools create -t ${{ env.IMAGE }}:frontend-latest \
+              ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}-amd64 \
+              ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}-arm64
+          fi
+
+      - name: Verify multi-arch manifest
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}
