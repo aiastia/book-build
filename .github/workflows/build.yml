@@ -81,13 +81,15 @@ jobs:
             *)           BT=backend-dev; FT=frontend-dev ;;
           esac
           case "$IMAGES" in
-            backend)  echo "build_backend=true";  echo "build_frontend=false" ;;
-            frontend) echo "build_backend=false"; echo "build_frontend=true" ;;
-            *)        echo "build_backend=true";  echo "build_frontend=true" ;;
+            backend)  BB=true;  BF=false ;;
+            frontend) BB=false; BF=true ;;
+            *)        BB=true;  BF=true ;;
           esac
           {
             echo "backend_tag=$BT"
             echo "frontend_tag=$FT"
+            echo "build_backend=$BB"
+            echo "build_frontend=$BF"
           } >> "$GITHUB_OUTPUT"
 
   # ============================ 后端 ============================
