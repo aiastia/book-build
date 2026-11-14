@@ -5,19 +5,16 @@
 
 ## 工作方式
 
-1. 只接受手动触发（`workflow_dispatch`），不接受 push / PR。
+1. 两种触发：
+   - **自动轮询**（每 5 分钟）：读私有仓 `dev` 分支 HEAD，与 `build-state` 分支
+     记的已构建 SHA 比对，有新 commit 才构建，成功后记账。push 私有仓 dev 后
+     什么都不用做，等 5-15 分钟自动建。
+   - **手动 dispatch**：私有仓 `scripts/trigger-build.sh`（立即构建、插队用）；
+     main 发版不走轮询，也走这条（`source_branch=main`）。
 2. 构建时用只读 deploy key 拉取私有源码仓，构建多架构镜像（amd64 + arm64 原生编译后合并）推送到 Docker Hub `aiastia/book`。
 3. 不使用 GHA 构建缓存（含源码的层会泄入公开仓缓存）。
-
-## 本地触发
-
-在私有源码仓库执行：
-
-```bash
-scripts/trigger-build.sh              # 构建当前 HEAD，前后端全量，正常推送
-scripts/trigger-build.sh HEAD backend # 只构建后端
-scripts/trigger-build.sh HEAD all true # dry_run：只构建不推送（验证链路）
-```
+4. upstream 仓库（aiastia-dockerhub/book）另有一个 relay workflow，push 到
+   upstream 时即时 dispatch 本仓构建（秒级延迟），轮询作其兜底。
 
 ## 安全说明
 
