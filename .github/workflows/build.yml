@@ -6,19 +6,31 @@
 #
 # 架构：
 #   私有仓 aiastia/book（源码，只读 deploy key 拉取）
-#     ↓ 本 workflow 手动触发（workflow_dispatch）
+#     ↓ 本 workflow 两种触发
 #   Docker Hub aiastia/book（镜像，必须保持 Private）
 #
+# 两种触发方式：
+#   1. workflow_dispatch（手动）：私有仓 scripts/trigger-build.sh，传源码
+#      commit SHA，立即构建——急用/发版/回滚/dry_run 走这条
+#   2. schedule 每小时轮询（20261115 增，替代已死的私有仓 push 触发）：
+#      北京时间 6-24 点之间每小时一次（UTC 22-23,0-15 点的 :13；GitHub
+#      cron 用 UTC）。读私有仓 dev HEAD，与 build-state 分支记的账比对，
+#      有新 commit 才构建，成功后记账。私有仓额度为零也不影响（轮询在
+#      公开仓跑，免费）。push 后自动构建最长等 ~1 小时（GitHub cron
+#      高峰还会飘几分钟）；急构建走 upstream relay（配了 BOOK_BUILD_PAT
+#      时秒级）或本地 trigger-build.sh。只有 dev 分支走轮询；main 发版
+#      低频谨慎，保持手动 dispatch（source_branch=main）。
+#
 # 本仓库只放本 workflow，不含源码。安全规则：
-#   - 只接受手动触发，无 push / pull_request 触发面
+#   - 手动触发无 push/PR 触发面；schedule 只做 ls-remote + 比对，不执行源码
 #   - secrets：SOURCE_DEPLOY_KEY（私有仓只读 deploy key 私钥）、
 #     DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（镜像推送凭证）
 #   - 不做 GHA 层缓存：cache-to type=gha mode=max 会把含源码的层写进
 #     公开仓缓存，任何人可通过 cache API 拉取（20261115 审查结论）
 #
 # 与原私有仓 ci.yml 的差异：
-#   - 删掉按目录变动过滤（公开仓分钟免费，过滤失去意义；跨仓 dispatch
-#     也没有天然的 base SHA）
+#   - 删掉按目录变动过滤（公开仓分钟免费，过滤失去意义；跨仓触发也没有
+#     天然的 base SHA）
 #   - GIT_COMMIT 从源码 checkout 实际解析（github.sha 在这里是本仓库的
 #     提交号，不是源码的）
 #   - 新增 images 选择器（all/backend/frontend）和 dry_run（只构建不推送）
@@ -47,8 +59,12 @@ on:
         description: 'true=只构建不推送不合并（验证链路用）'
         required: false
         default: 'false'
+  schedule:
+    # 北京时间 6-24 点每小时一次（UTC 22,23,0-15 点的 13 分；6:13/7:13/.../23:13）
+    - cron: '13 22-23,0-15 * * *'
 
-# 同一时刻只允许一个构建在跑，避免同 tag 互相覆盖（排队不取消）
+# 同一时刻只允许一个工作流实例（含排队的轮询），避免同 tag 互相覆盖；
+# 轮询排在构建后面时，轮到它跑会发现账已记好，秒退
 concurrency:
   group: docker-build
   cancel-in-progress: false
@@ -60,22 +76,52 @@ env:
   IMAGE: aiastia/book
 
 jobs:
-  # ============================ tag 计算 ============================
+  # ============================ 构建判定 ============================
+  # dispatch：按 inputs 直接构建。
+  # schedule：读私有仓 dev HEAD，与 build-state 分支记的已构建 SHA 比对，
+  # 一致则 should_build=false（本轮全部 job 跳过，~20 秒结束）。
   setup:
-    name: 计算镜像 tag 与构建范围
+    name: 判定是否需要构建
     runs-on: ubuntu-24.04
     outputs:
-      backend_tag: ${{ steps.tags.outputs.backend_tag }}
-      frontend_tag: ${{ steps.tags.outputs.frontend_tag }}
-      build_backend: ${{ steps.tags.outputs.build_backend }}
-      build_frontend: ${{ steps.tags.outputs.build_frontend }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+      source_ref: ${{ steps.decide.outputs.source_ref }}
+      source_branch: ${{ steps.decide.outputs.source_branch }}
+      backend_tag: ${{ steps.decide.outputs.backend_tag }}
+      frontend_tag: ${{ steps.decide.outputs.frontend_tag }}
+      build_backend: ${{ steps.decide.outputs.build_backend }}
+      build_frontend: ${{ steps.decide.outputs.build_frontend }}
     steps:
-      - id: tags
+      - id: decide
         env:
-          BRANCH: ${{ inputs.source_branch }}
-          IMAGES: ${{ inputs.images }}
+          EVENT: ${{ github.event_name }}
+          BRANCH_IN: ${{ inputs.source_branch }}
+          REF_IN: ${{ inputs.source_ref }}
+          IMAGES_IN: ${{ inputs.images }}
+          DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
         run: |
-          # dev → -dev 后缀不覆盖生产镜像；main/master → 正式 tag（与原 ci.yml 同语义）
+          set -euo pipefail
+          if [ "$EVENT" = "schedule" ]; then
+            # 轮询路径：只读 dev HEAD（ls-remote，不 clone 不执行任何源码）
+            mkdir -p ~/.ssh
+            printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+            DEV_SHA=$(GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes" \
+              git ls-remote git@github.com:aiastia/book.git refs/heads/dev | cut -f1)
+            rm -f ~/.ssh/deploy_key
+            if [ -z "$DEV_SHA" ]; then
+              echo "::error::读不到私有仓 dev HEAD（deploy key 失效？）"; exit 1
+            fi
+            # 已构建记账：build-state 分支的 .build-state/dev 文件存着上次成功构建的 SHA
+            BUILT_SHA=$(curl -fsSL "https://raw.githubusercontent.com/aiastia/book-build/build-state/.build-state/dev" 2>/dev/null || echo "")
+            if [ "$DEV_SHA" = "$BUILT_SHA" ]; then SHOULD=false; else SHOULD=true; fi
+            BRANCH=dev; REF="$DEV_SHA"; IMAGES=all
+            echo "轮询结果: dev@$DEV_SHA 已构建=$BUILT_SHA → should_build=$SHOULD"
+          else
+            SHOULD=true
+            BRANCH="${BRANCH_IN:-dev}"; REF="${REF_IN:-dev}"; IMAGES="${IMAGES_IN:-all}"
+          fi
           case "$BRANCH" in
             main|master) BT=backend;  FT=frontend ;;
             *)           BT=backend-dev; FT=frontend-dev ;;
@@ -86,6 +132,9 @@ jobs:
             *)        BB=true;  BF=true ;;
           esac
           {
+            echo "should_build=$SHOULD"
+            echo "source_ref=$REF"
+            echo "source_branch=$BRANCH"
             echo "backend_tag=$BT"
             echo "frontend_tag=$FT"
             echo "build_backend=$BB"
@@ -98,14 +147,14 @@ jobs:
   build-backend-amd64:
     name: 后端 amd64
     needs: setup
-    if: needs.setup.outputs.build_backend == 'true'
+    if: needs.setup.outputs.should_build == 'true' && needs.setup.outputs.build_backend == 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: 拉取私有源码
         uses: actions/checkout@v6
         with:
           repository: aiastia/book
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.setup.outputs.source_ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source
@@ -133,10 +182,10 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ needs.setup.outputs.backend_tag }}-amd64
           # 禁用 provenance/attestation，否则合并出的 manifest list 带 attestation 项
           provenance: false
-          # 版本信息注入 /api/health（BUILD_TIME 用 run_started_at：dispatch 无 head_commit）
+          # 版本信息注入 /api/health（BUILD_TIME 用 run_started_at：dispatch/schedule 无 head_commit）
           build-args: |
             GIT_COMMIT=${{ env.SOURCE_SHA }}
-            GIT_BRANCH=${{ inputs.source_branch }}
+            GIT_BRANCH=${{ needs.setup.outputs.source_branch }}
             BUILD_TIME=${{ github.run_started_at }}
 
     outputs:
@@ -145,14 +194,14 @@ jobs:
   build-backend-arm64:
     name: 后端 arm64
     needs: setup
-    if: needs.setup.outputs.build_backend == 'true'
+    if: needs.setup.outputs.should_build == 'true' && needs.setup.outputs.build_backend == 'true'
     runs-on: ubuntu-24.04-arm  # 原生 ARM runner，不用 QEMU
     steps:
       - name: 拉取私有源码
         uses: actions/checkout@v6
         with:
           repository: aiastia/book
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.setup.outputs.source_ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source
@@ -181,7 +230,7 @@ jobs:
           provenance: false
           build-args: |
             GIT_COMMIT=${{ env.SOURCE_SHA }}
-            GIT_BRANCH=${{ inputs.source_branch }}
+            GIT_BRANCH=${{ needs.setup.outputs.source_branch }}
             BUILD_TIME=${{ github.run_started_at }}
 
     outputs:
@@ -190,7 +239,7 @@ jobs:
   merge-backend:
     name: 合并后端多架构 tag
     needs: [setup, build-backend-amd64, build-backend-arm64]
-    if: inputs.dry_run != 'true'
+    if: needs.setup.outputs.should_build == 'true' && inputs.dry_run != 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: Log in to Docker Hub
@@ -221,14 +270,14 @@ jobs:
   build-frontend-amd64:
     name: 前端 amd64
     needs: setup
-    if: needs.setup.outputs.build_frontend == 'true'
+    if: needs.setup.outputs.should_build == 'true' && needs.setup.outputs.build_frontend == 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: 拉取私有源码
         uses: actions/checkout@v6
         with:
           repository: aiastia/book
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.setup.outputs.source_ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source
@@ -261,14 +310,14 @@ jobs:
   build-frontend-arm64:
     name: 前端 arm64
     needs: setup
-    if: needs.setup.outputs.build_frontend == 'true'
+    if: needs.setup.outputs.should_build == 'true' && needs.setup.outputs.build_frontend == 'true'
     runs-on: ubuntu-24.04-arm  # 原生 ARM runner，不用 QEMU
     steps:
       - name: 拉取私有源码
         uses: actions/checkout@v6
         with:
           repository: aiastia/book
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.setup.outputs.source_ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source
@@ -301,7 +350,7 @@ jobs:
   merge-frontend:
     name: 合并前端多架构 tag
     needs: [setup, build-frontend-amd64, build-frontend-arm64]
-    if: inputs.dry_run != 'true'
+    if: needs.setup.outputs.should_build == 'true' && inputs.dry_run != 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: Log in to Docker Hub
@@ -327,3 +376,45 @@ jobs:
 
       - name: Verify multi-arch manifest
         run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ needs.setup.outputs.frontend_tag }}
+
+  # ============================ 构建记账 ============================
+  # 成功推送并合并后，把源码 SHA 记到 build-state 分支（.build-state/<分支>
+  # 文件），供 schedule 轮询比对。build-state 分支已预建（1115 从 main 建，
+  # 避免依赖 contents API 的分支自建行为）。dry_run 不记账。
+  # 并发被 workflow 级 concurrency group 串行化，记账无竞态。
+  mark-built:
+    name: 记账已构建 SHA
+    needs: [setup, merge-backend, merge-frontend]
+    if: >-
+      !cancelled() &&
+      needs.setup.outputs.should_build == 'true' &&
+      inputs.dry_run != 'true' &&
+      (needs.merge-backend.result == 'success' || needs.merge-frontend.result == 'success')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: ${{ needs.setup.outputs.source_branch }}
+      SHA: ${{ needs.setup.outputs.source_ref }}
+    steps:
+      - name: 写入 build-state 分支
+        run: |
+          set -euo pipefail
+          PATH_PART=".build-state/$BRANCH"
+          CONTENT=$(printf '%s' "$SHA" | base64)
+          # 更新已存在的文件必须带旧文件 sha（409 冲突），不存在则不带
+          FILE_SHA=$(gh api "repos/aiastia/book-build/contents/$PATH_PART?ref=build-state" --jq .sha 2>/dev/null || echo "")
+          if [ -n "$FILE_SHA" ]; then
+            gh api -X PUT "repos/aiastia/book-build/contents/$PATH_PART" \
+              -f message="built: $BRANCH @ $SHA" \
+              -f content="$CONTENT" \
+              -f branch=build-state \
+              -f sha="$FILE_SHA" --jq '.commit.sha'
+          else
+            gh api -X PUT "repos/aiastia/book-build/contents/$PATH_PART" \
+              -f message="built: $BRANCH @ $SHA" \
+              -f content="$CONTENT" \
+              -f branch=build-state --jq '.commit.sha'
+          fi
+          echo "✅ 已记账 build-state: $BRANCH @ $SHA"
