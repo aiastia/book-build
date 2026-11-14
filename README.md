@@ -6,9 +6,9 @@
 ## 工作方式
 
 1. 两种触发：
-   - **自动轮询**（每 5 分钟）：读私有仓 `dev` 分支 HEAD，与 `build-state` 分支
-     记的已构建 SHA 比对，有新 commit 才构建，成功后记账。push 私有仓 dev 后
-     什么都不用做，等 5-15 分钟自动建。
+   - **自动轮询**（北京时间 6-24 点每小时一次）：读私有仓 `dev` 分支 HEAD，
+     与 `build-state` 分支记的已构建 SHA 比对，有新 commit 才构建，成功后
+     记账。push 私有仓 dev 后什么都不用做，最长等 ~1 小时自动建。
    - **手动 dispatch**：私有仓 `scripts/trigger-build.sh`（立即构建、插队用）；
      main 发版不走轮询，也走这条（`source_branch=main`）。
 2. 构建时用只读 deploy key 拉取私有源码仓，构建多架构镜像（amd64 + arm64 原生编译后合并）推送到 Docker Hub `aiastia/book`。
